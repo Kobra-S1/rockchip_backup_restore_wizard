@@ -22,6 +22,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DATA_DIR="$SCRIPT_DIR"       # image directory (input for restore, output for backup)
 XROCK=""                     # resolved below
 DEVICE_CONNECTED=0           # 1 once download mode entered
+RAW_FULL_BACKUP=0            # 1 to perform full raw eMMC dump and exit
+RAW_FULL_RESTORE=0           # 1 to restore full raw eMMC image and exit
 
 # Partition table — populated by parse_partition_table()
 PARTITION_NAMES=()
@@ -475,6 +477,128 @@ read_partition() {
     fi
 }
 
+# Backup: read the entire flash device from sector 0 to end
+full_raw_backup() {
+    local output="$DATA_DIR/full_emmc.img"
+    local flash_bytes flash_sectors
+
+    flash_bytes=$(get_flash_capacity_bytes)
+    if [ "$flash_bytes" -le 0 ]; then
+        err "Could not determine flash capacity from xrock"
+        exit 1
+    fi
+
+    flash_sectors=$((flash_bytes / 512))
+
+    info "Flash capacity: $(human_size "$flash_bytes") ($flash_sectors sectors)"
+    info "Output file:    $output"
+
+    if [ -f "$output" ]; then
+        warn "Output file already exists and will be overwritten: $output"
+        read -rp "Overwrite existing full raw backup? [y/N] " overwrite
+        if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
+            echo "Aborted."
+            exit 0
+        fi
+    fi
+
+    # Check available disk space
+    local avail_kb needed_kb
+    avail_kb=$(df -k "$DATA_DIR" | tail -1 | awk '{print $4}')
+    needed_kb=$((flash_bytes / 1024))
+    if [ "$avail_kb" -lt "$needed_kb" ]; then
+        err "Not enough disk space for full raw backup"
+        err "Need ~$(human_size "$flash_bytes"), have ~$(human_size $((avail_kb * 1024)))"
+        exit 1
+    fi
+
+    warn "Full raw backup reads the entire eMMC and can take a long time."
+    read -rp "Start full raw backup now? [Y/n] " confirm
+    if [[ "$confirm" =~ ^[Nn]$ ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+
+    log "Reading full flash ($flash_sectors sectors) from sector 0..."
+    if "$XROCK" flash read 0 "$flash_sectors" "$output"; then
+        local actual_size
+        actual_size=$(ls -lh "$output" | awk '{print $5}')
+        log "Full raw backup complete ($actual_size) → $output"
+        info "To raw-restore manually (dangerous), use:"
+        info "  $XROCK flash write 0 $output"
+    else
+        err "Failed to read full flash"
+        exit 1
+    fi
+}
+
+# Restore: write a full raw eMMC image from sector 0
+full_raw_restore() {
+    local input="$DATA_DIR/full_emmc.img"
+    local img_bytes img_sectors flash_bytes flash_sectors
+
+    if [ ! -f "$input" ] && [ -f "$DATA_DIR/full_emmc.bin" ]; then
+        input="$DATA_DIR/full_emmc.bin"
+    fi
+
+    if [ ! -f "$input" ]; then
+        warn "Full raw image not found at $DATA_DIR/full_emmc.img"
+        if ! prompt_for_file input "full raw eMMC image"; then
+            exit 1
+        fi
+    fi
+
+    img_bytes=$(wc -c < "$input")
+    if [ "$img_bytes" -le 0 ]; then
+        err "Raw image is empty: $input"
+        exit 1
+    fi
+
+    if [ $((img_bytes % 512)) -ne 0 ]; then
+        err "Raw image is not 512-byte aligned: $input"
+        err "Size is $img_bytes bytes; expected a multiple of 512."
+        exit 1
+    fi
+
+    flash_bytes=$(get_flash_capacity_bytes)
+    if [ "$flash_bytes" -le 0 ]; then
+        err "Could not determine flash capacity from xrock"
+        exit 1
+    fi
+
+    img_sectors=$((img_bytes / 512))
+    flash_sectors=$((flash_bytes / 512))
+
+    info "Flash capacity: $(human_size "$flash_bytes") ($flash_sectors sectors)"
+    info "Input image:    $input"
+    info "Image size:     $(human_size "$img_bytes") ($img_sectors sectors)"
+
+    if [ "$img_bytes" -gt "$flash_bytes" ]; then
+        err "Raw image is larger than flash capacity"
+        err "Image: $(human_size "$img_bytes"), flash: $(human_size "$flash_bytes")"
+        exit 1
+    fi
+
+    warn "THIS WILL OVERWRITE THE ENTIRE eMMC FROM SECTOR 0."
+    warn "All partitions and data on the device will be replaced."
+    read -rp "Type YES to continue full raw restore: " confirm
+    if [ "$confirm" != "YES" ]; then
+        echo "Aborted."
+        exit 0
+    fi
+
+    log "Writing full raw image ($img_sectors sectors) to sector 0..."
+    if "$XROCK" flash write 0 "$input"; then
+        log "Full raw restore complete"
+    else
+        err "Failed to write full raw image"
+        exit 1
+    fi
+
+    log "Resetting device..."
+    "$XROCK" reset 2>/dev/null || warn "Auto-reset failed — manually power cycle the device"
+}
+
 # ── Usage ────────────────────────────────────────────────────────────────────
 
 usage() {
@@ -499,6 +623,8 @@ Options:
   -d DIR    Directory for partition images
             Backup: where to save images (default: script directory)
             Restore: where to find images (default: script directory)
+  -R        Backup only: dump full raw eMMC to DIR/full_emmc.img and exit
+  -W        Restore only: write DIR/full_emmc.img to sector 0 and exit
   -l FILE   Path to a loader binary (.bin) for MASKROM download mode
             (default: rv1106_download_loader.bin in the script directory)
   -x PATH   Path to xrock binary (default: auto-detect via PATH)
@@ -510,9 +636,11 @@ rv1106_usbplug_*.bin) are expected in the same directory as this script.
 Examples:
   $(basename "$0") backup                                  # interactive backup
   $(basename "$0") backup  -d ../backups all               # back up everything
+  $(basename "$0") backup  -d ../backups -R                # full raw backup (whole eMMC)
   $(basename "$0") backup  -l /path/to/custom_loader.bin   # use a custom loader
   $(basename "$0") restore                                 # interactive restore
   $(basename "$0") restore -d ../backups app               # restore app from backups dir
+  $(basename "$0") restore -d ../backups -W                # full raw restore (whole eMMC)
 EOF
     exit 0
 }
@@ -534,17 +662,34 @@ esac
 
 # ── Parse options ────────────────────────────────────────────────────────────
 
-while getopts ":d:x:l:h" opt; do
+while getopts ":d:x:l:RWh" opt; do
     case "$opt" in
         d) DATA_DIR="$OPTARG" ;;
         x) XROCK="$OPTARG" ;;
         l) DOWNLOAD_BIN="$OPTARG" ;;
+        R) RAW_FULL_BACKUP=1 ;;
+        W) RAW_FULL_RESTORE=1 ;;
         h) usage ;;
         \?) echo "Unknown option: -$OPTARG" >&2; usage ;;
         :)  echo "Option -$OPTARG requires an argument" >&2; usage ;;
     esac
 done
 shift $((OPTIND - 1))
+
+if [ "$MODE" != "backup" ] && [ "$RAW_FULL_BACKUP" = "1" ]; then
+    err "Option -R is only valid with the 'backup' subcommand"
+    exit 1
+fi
+
+if [ "$MODE" != "restore" ] && [ "$RAW_FULL_RESTORE" = "1" ]; then
+    err "Option -W is only valid with the 'restore' subcommand"
+    exit 1
+fi
+
+if [ "$RAW_FULL_BACKUP" = "1" ] && [ "$RAW_FULL_RESTORE" = "1" ]; then
+    err "Options -R and -W cannot be used together"
+    exit 1
+fi
 
 # ── Resolve xrock ───────────────────────────────────────────────────────────
 
@@ -591,6 +736,20 @@ if [ "$MODE" = "backup" ]; then
         exit 1
     fi
     log "Device ready"
+
+    if [ "$RAW_FULL_BACKUP" = "1" ]; then
+        if [ $# -gt 0 ]; then
+            warn "Ignoring partition arguments in full raw backup mode"
+        fi
+
+        full_raw_backup
+        echo ""
+        echo "============================================================"
+        echo -e "  ${GREEN}FULL RAW BACKUP COMPLETE${NC}"
+        echo "============================================================"
+        echo ""
+        exit 0
+    fi
 
     # ── Read env to discover partition table ──────────────────────────────
     # env is always the first partition at sector 0. Read 64 sectors (32K)
@@ -815,6 +974,37 @@ elif [ "$MODE" = "restore" ]; then
     info "Images:    $DATA_DIR"
     info "Loaders:   $SCRIPT_DIR"
     echo ""
+
+    if [ "$RAW_FULL_RESTORE" = "1" ]; then
+        if [ $# -gt 0 ]; then
+            warn "Ignoring partition arguments in full raw restore mode"
+        fi
+
+        info "xrock:     ${XROCK:-<not found>}"
+        preflight_tools
+
+        if [ "$DEVICE_CONNECTED" = "1" ]; then
+            log "Device already in download mode"
+        else
+            enter_download_mode
+
+            log "Verifying device is ready..."
+            if ! "$XROCK" ready; then
+                err "Device not ready after entering download mode"
+                exit 1
+            fi
+            log "Device ready"
+        fi
+
+        full_raw_restore
+
+        echo ""
+        echo "============================================================"
+        echo -e "  ${GREEN}FULL RAW RESTORE COMPLETE${NC}"
+        echo "============================================================"
+        echo ""
+        exit 0
+    fi
 
     # ── Find or read the env image ────────────────────────────────────────
     ENV_IMAGE="$DATA_DIR/env"
