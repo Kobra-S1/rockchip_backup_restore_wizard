@@ -27,6 +27,7 @@ DEVICE_CONNECTED=0           # 1 once download mode entered
 PARTITION_NAMES=()
 declare -A PARTITION_SECTORS  # name → start sector
 declare -A PARTITION_SIZES    # name → size string (e.g. "512M")
+declare -A PARTITION_RESOLVED_BYTES  # name → computed bytes for dynamic size entries
 
 SELECTED_LIST=()              # partitions chosen for backup/restore
 declare -A IMAGE_PATHS        # (restore) name → resolved image file path
@@ -96,6 +97,14 @@ prompt_for_file() {
 # Convert a size string (e.g. "32K", "512M", "6600M") to bytes
 size_to_bytes() {
     local s="$1"
+
+    # Rockchip partition tables may use '-' to mean "use remaining space".
+    # Return -1 as a sentinel for unknown/remaining size.
+    if [ "$s" = "-" ]; then
+        echo "-1"
+        return
+    fi
+
     local num="${s%[KkMmGg]}"
     local suffix="${s: -1}"
 
@@ -108,9 +117,155 @@ size_to_bytes() {
     esac
 }
 
+# Resolve a partition's size to bytes.
+# Returns -1 when the partition uses '-' and has not been resolved yet.
+partition_size_bytes() {
+    local name="$1"
+    local raw="${PARTITION_SIZES[$name]}"
+
+    if [ "$raw" = "-" ]; then
+        if [ -n "${PARTITION_RESOLVED_BYTES[$name]+x}" ]; then
+            echo "${PARTITION_RESOLVED_BYTES[$name]}"
+        else
+            echo "-1"
+        fi
+        return
+    fi
+
+    size_to_bytes "$raw"
+}
+
+# Query flash capacity from xrock and return bytes, or -1 on failure.
+get_flash_capacity_bytes() {
+    local flash_info cap_mb
+    flash_info=$("$XROCK" flash 2>/dev/null || true)
+    cap_mb=$(printf '%s\n' "$flash_info" | sed -n 's/.*Capacity:[[:space:]]*\([0-9][0-9]*\)MB.*/\1/p' | head -1)
+
+    if [ -z "$cap_mb" ]; then
+        echo "-1"
+        return
+    fi
+
+    echo $((cap_mb * 1024 * 1024))
+}
+
+# If the final partition size is '-', resolve it to remaining flash bytes.
+resolve_last_remaining_partition_size() {
+    if [ ${#PARTITION_NAMES[@]} -eq 0 ]; then
+        return
+    fi
+
+    local last_index=$(( ${#PARTITION_NAMES[@]} - 1 ))
+    local last_name="${PARTITION_NAMES[$last_index]}"
+
+    if [ "${PARTITION_SIZES[$last_name]}" != "-" ]; then
+        return
+    fi
+
+    local flash_bytes
+    flash_bytes=$(get_flash_capacity_bytes)
+    if [ "$flash_bytes" -le 0 ]; then
+        warn "Could not read flash capacity from xrock; '$last_name' remains unresolved ('-')."
+        return
+    fi
+
+    local start_sector="${PARTITION_SECTORS[$last_name]}"
+    local start_bytes=$((start_sector * 512))
+    local remaining=$((flash_bytes - start_bytes))
+
+    if [ "$remaining" -le 0 ]; then
+        warn "Computed non-positive remaining size for '$last_name'; leaving unresolved."
+        return
+    fi
+
+    # Round down to full sectors for flash read/write operations.
+    remaining=$(((remaining / 512) * 512))
+    PARTITION_RESOLVED_BYTES["$last_name"]="$remaining"
+    log "Resolved '$last_name' from '-' to $(human_size "$remaining") based on flash capacity"
+}
+
+# Return the maximum writable sectors for a partition.
+# Uses next partition start for non-final entries; for final entries, uses the
+# parsed size (including resolved '-' when available). Returns -1 if unknown.
+partition_max_sectors() {
+    local name="$1"
+    local idx=-1
+
+    for i in "${!PARTITION_NAMES[@]}"; do
+        if [ "${PARTITION_NAMES[$i]}" = "$name" ]; then
+            idx="$i"
+            break
+        fi
+    done
+
+    if [ "$idx" -lt 0 ]; then
+        echo "-1"
+        return
+    fi
+
+    local start_sector="${PARTITION_SECTORS[$name]}"
+    local last_index=$(( ${#PARTITION_NAMES[@]} - 1 ))
+
+    if [ "$idx" -lt "$last_index" ]; then
+        local next_name="${PARTITION_NAMES[$((idx + 1))]}"
+        local next_sector="${PARTITION_SECTORS[$next_name]}"
+        echo $((next_sector - start_sector))
+        return
+    fi
+
+    local part_bytes
+    part_bytes=$(partition_size_bytes "$name")
+    if [ "$part_bytes" -lt 0 ]; then
+        echo "-1"
+        return
+    fi
+
+    echo $((part_bytes / 512))
+}
+
+# Validate that selected restore images fit in their destination partitions.
+validate_restore_image_sizes() {
+    local name img img_bytes img_sectors max_sectors max_bytes
+
+    for name in "${SELECTED_LIST[@]}"; do
+        img="${IMAGE_PATHS[$name]}"
+        img_bytes=$(wc -c < "$img")
+
+        if [ "$img_bytes" -le 0 ]; then
+            err "Image for '$name' is empty: $img"
+            exit 1
+        fi
+
+        if [ $((img_bytes % 512)) -ne 0 ]; then
+            err "Image for '$name' is not 512-byte aligned: $img"
+            err "Size is $img_bytes bytes; expected a multiple of 512 for flash write."
+            exit 1
+        fi
+
+        img_sectors=$((img_bytes / 512))
+        max_sectors=$(partition_max_sectors "$name")
+
+        if [ "$max_sectors" -lt 0 ]; then
+            warn "Could not verify partition limit for '$name'; proceeding with image size checks disabled for this partition."
+            continue
+        fi
+
+        if [ "$img_sectors" -gt "$max_sectors" ]; then
+            max_bytes=$((max_sectors * 512))
+            err "Image for '$name' is too large for destination partition"
+            err "Image: $(human_size "$img_bytes") ($img_sectors sectors), partition max: $(human_size "$max_bytes") ($max_sectors sectors)"
+            exit 1
+        fi
+    done
+}
+
 # Format bytes as human-readable (e.g. 1073741824 → "1.0G")
 human_size() {
     local bytes="$1"
+    if [ "$bytes" -lt 0 ]; then
+        echo "remaining"
+        return
+    fi
     if [ "$bytes" -ge $((1024 * 1024 * 1024)) ]; then
         echo "$(echo "scale=1; $bytes / 1073741824" | bc)G"
     elif [ "$bytes" -ge $((1024 * 1024)) ]; then
@@ -188,7 +343,9 @@ parse_partition_table() {
         PARTITION_SIZES["$name"]="$size_str"
         PARTITION_NAMES+=("$name")
 
-        cursor=$((cursor + size_bytes))
+        if [ "$size_bytes" -ge 0 ]; then
+            cursor=$((cursor + size_bytes))
+        fi
     done
 
     echo ""
@@ -448,6 +605,7 @@ if [ "$MODE" = "backup" ]; then
     log "env saved → $ENV_FILE"
 
     parse_partition_table "$ENV_FILE"
+    resolve_last_remaining_partition_size
 
     # Self-correct: re-read env if actual size differs from 32K assumption
     if [ -n "${PARTITION_SIZES[env]+x}" ]; then
@@ -465,11 +623,21 @@ if [ "$MODE" = "backup" ]; then
     # ── Show partition table ──────────────────────────────────────────────
     # Build selectable list (everything except env, which is already saved)
     selectable_names=()
+    skipped_unknown_size=()
     for name in "${PARTITION_NAMES[@]}"; do
         if [ "$name" != "env" ]; then
-            selectable_names+=("$name")
+            if [ "$(partition_size_bytes "$name")" -lt 0 ]; then
+                skipped_unknown_size+=("$name")
+            else
+                selectable_names+=("$name")
+            fi
         fi
     done
+
+    if [ ${#skipped_unknown_size[@]} -gt 0 ]; then
+        warn "Skipping partition(s) with remaining-size marker '-' in backup: ${skipped_unknown_size[*]}"
+        warn "These can still be restored from image files, but size cannot be inferred for raw read."
+    fi
 
     echo ""
     printf "  ${CYAN}%-4s %-14s %-8s %-12s %s${NC}\n" \
@@ -484,7 +652,7 @@ if [ "$MODE" = "backup" ]; then
         name="${selectable_names[$s]}"
         sec="${PARTITION_SECTORS[$name]}"
         sec_hex=$(printf "0x%08x" "$sec")
-        size_bytes=$(size_to_bytes "${PARTITION_SIZES[$name]}")
+        size_bytes=$(partition_size_bytes "$name")
 
         existing=""
         if [ -f "$DATA_DIR/$name" ]; then
@@ -555,7 +723,12 @@ if [ "$MODE" = "backup" ]; then
     info "Selected for backup (${#SELECTED_LIST[@]} + env):"
     printf "  %-14s %s\n" "env" "$(human_size "$(size_to_bytes "${PARTITION_SIZES[env]}")")"
     for name in "${SELECTED_LIST[@]}"; do
-        size_bytes=$(size_to_bytes "${PARTITION_SIZES[$name]}")
+        size_bytes=$(partition_size_bytes "$name")
+        if [ "$size_bytes" -lt 0 ]; then
+            err "Cannot back up '$name' because its size is '-' (remaining space)"
+            err "Select fixed-size partitions only, or back up this partition with another method."
+            exit 1
+        fi
         total_bytes=$((total_bytes + size_bytes))
         printf "  %-14s %s\n" "$name" "$(human_size "$size_bytes")"
     done
@@ -587,7 +760,11 @@ if [ "$MODE" = "backup" ]; then
     for name in "${SELECTED_LIST[@]}"; do
         completed=$((completed + 1))
         sector="${PARTITION_SECTORS[$name]}"
-        size_bytes=$(size_to_bytes "${PARTITION_SIZES[$name]}")
+        size_bytes=$(partition_size_bytes "$name")
+        if [ "$size_bytes" -lt 0 ]; then
+            err "Cannot back up '$name' because its size is '-' (remaining space)"
+            exit 1
+        fi
         sector_count=$((size_bytes / 512))
         size_h=$(human_size "$size_bytes")
         output="$DATA_DIR/$name"
@@ -838,6 +1015,11 @@ elif [ "$MODE" = "restore" ]; then
         log "Device ready"
     fi
 
+    # Resolve trailing '-' partition size from flash capacity when possible,
+    # then validate every selected image fits its destination partition.
+    resolve_last_remaining_partition_size
+    validate_restore_image_sizes
+
     completed=0
     total=${#SELECTED_LIST[@]}
 
@@ -846,8 +1028,13 @@ elif [ "$MODE" = "restore" ]; then
         log "[$completed/$total] Restoring $name..."
 
         part_size="${PARTITION_SIZES[$name]}"
-        size_bytes=$(size_to_bytes "$part_size")
-        if [ "$size_bytes" -gt $((100 * 1024 * 1024)) ]; then
+        size_bytes=$(partition_size_bytes "$name")
+        if [ "$size_bytes" -lt 0 ]; then
+            img_bytes=$(wc -c < "${IMAGE_PATHS[$name]}")
+            if [ "$img_bytes" -gt $((100 * 1024 * 1024)) ]; then
+                warn "$name image is ~$(human_size "$img_bytes") — this may take several minutes..."
+            fi
+        elif [ "$size_bytes" -gt $((100 * 1024 * 1024)) ]; then
             warn "$name is ~$part_size — this may take several minutes..."
         fi
 
