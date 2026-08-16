@@ -79,6 +79,19 @@ under `bin/rv11/` — use the latest versions. They can also be found in the
 LuckFox Pico SDK (`tools/` directory) or bundled with some vendor firmware
 packages.
 
+Run `./installer.sh` to fetch the DDR + USB plug fallback pair automatically:
+
+```bash
+./installer.sh          # downloads into the script directory
+./installer.sh -d DIR   # downloads into DIR instead
+./installer.sh -f       # re-download even if the files already exist
+```
+
+`rv1106_download_loader.bin` isn't published as a standalone file upstream
+(it's built by merging DDR+HPMCU+SPL blobs with rkbin's `boot_merger` tool),
+so `installer.sh` doesn't fetch it — the repo already ships one, and the
+fallback pair above is what `installer.sh` gets you if you need to replace it.
+
 The script tries the download loader first, then automatically falls back to
 `xrock maskrom <ddr> <usbplug> --rc4-off`.
 
